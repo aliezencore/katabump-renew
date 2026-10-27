@@ -29,11 +29,10 @@ jobs:
         seleniumbase install chromedriver
 
     - name: ⚙ 设置代理 (sing-box)
-      continue-on-error: true
       env:
         NODE_LINK: ${{ secrets.NODE_LINK }}
       run: |
-        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+        bash scripts/setup_proxy.sh
 
     - name: 🚀 运行续期脚本
       timeout-minutes: 60   # 防止多账号异常卡死吃满 6 小时上限
