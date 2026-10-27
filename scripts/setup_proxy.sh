@@ -122,6 +122,7 @@ congestion="bbr"
 username=""
 password2=""
 version="5"
+vmess_scy="auto"
 
 case "$proto" in
   vmess)
@@ -146,6 +147,19 @@ case "$proto" in
     host="$(echo "$json" | jq -r '.host // ""')"
     path="$(echo "$json" | jq -r '.path // "/"')"
     fp="$(echo "$json" | jq -r '.fp // "chrome"')"
+    vmess_scy="$(echo "$json" | jq -r '.scy // "auto"')"
+    [ -z "$vmess_scy" ] && vmess_scy="auto"
+
+    # vmess 分享链接里 net 与 type 是两个独立字段：
+    #   net  = 底层传输 (tcp/ws/grpc/h2/quic)
+    #   type = 伪装头，仅当 net=tcp 时有意义（常见 "http"，即 TCP 伪装成 HTTP）
+    # 所以 transport 必须由「net + type」共同决定，不能只拿 net 当 transport 类型。
+    vmess_type="$(echo "$json" | jq -r '.type // ""')"
+    if [ "$net" = "tcp" ] && [ "$vmess_type" = "http" ]; then
+      # TCP + HTTP 伪装：sing-box 用 transport type=http 表达
+      net="http"
+    fi
+
     [ "$tls_flag" = "tls" ] && security="tls"
     [ -z "$sni" ] && sni="$server"
     [ -z "$host" ] && host="$server"
@@ -299,15 +313,24 @@ echo "[INFO] 节点: $server:$port  transport=$net  tls=$security"
 # ---------- 构建 outbound ----------
 o="{\"type\":\"$type\",\"tag\":\"proxy\",\"server\":\"$server\",\"server_port\":$port"
 
-# transport：仅当 net 不是 tcp 时才写入（tcp 表示不使用额外传输层）
+# transport：由 net 决定（vmess 的 tcp+type=http 已在解析阶段映射为 http）
 # sing-box 的 transport 合法类型只有 http / ws / quic / grpc / httpupgrade
+# net=tcp/none 表示不使用额外传输层，此时必须省略 transport 字段
 case "$net" in
   ""|tcp|none) : ;;
   ws)
-    o="$o,\"transport\":{\"type\":\"ws\",\"path\":\"$path\",\"headers\":{\"Host\":\"$host\"}}"
+    if [ -n "$host" ]; then
+      o="$o,\"transport\":{\"type\":\"ws\",\"path\":\"$path\",\"headers\":{\"Host\":\"$host\"}}"
+    else
+      o="$o,\"transport\":{\"type\":\"ws\",\"path\":\"$path\"}"
+    fi
     ;;
   http|h2)
-    o="$o,\"transport\":{\"type\":\"http\",\"host\":[\"$host\"],\"path\":\"$path\"}"
+    if [ -n "$host" ]; then
+      o="$o,\"transport\":{\"type\":\"http\",\"host\":[\"$host\"],\"path\":\"$path\"}"
+    else
+      o="$o,\"transport\":{\"type\":\"http\",\"path\":\"$path\"}"
+    fi
     ;;
   grpc)
     o="$o,\"transport\":{\"type\":\"grpc\",\"service_name\":\"$path\"}"
@@ -325,7 +348,7 @@ esac
 
 case "$type" in
   vmess)
-    o="$o,\"uuid\":\"$uuid\",\"security\":\"auto\""
+    o="$o,\"uuid\":\"$uuid\",\"security\":\"$vmess_scy\""
     if [ "$security" = "tls" ]; then
       o="$o,\"tls\":{\"enabled\":true,\"server_name\":\"$sni\",\"insecure\":$insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$fp\"}}"
     fi
