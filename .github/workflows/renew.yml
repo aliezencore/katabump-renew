@@ -2,7 +2,9 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-  - cron: '30 22 */3 * *'  # 每天 UTC 22:30 (北京时间 6:30点) 运行,根据服务到期时间自行修改
+  # 每 3 天 UTC 22:30（北京时间次日 6:30）运行一次
+  # 注意：*/3 在月末会从 31 跳回 1，间隔缩短为 1 天，属于 cron 的正常行为
+  - cron: '30 22 */3 * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:
@@ -34,9 +36,9 @@ jobs:
         bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
     - name: 🚀 运行续期脚本
+      timeout-minutes: 60   # 防止多账号异常卡死吃满 6 小时上限
       env:
-        KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
-        KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+        KATABUMP_ACCOUNTS: ${{ secrets.KATABUMP_ACCOUNTS }}  # 多账号（JSON 数组）
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
@@ -44,7 +46,9 @@ jobs:
           python3 app.py
 
     # 更新时间到time.txt,避免90天未更新导致工作流暂停
+    # 必须用 always()：否则续期失败时本步骤被跳过，反而在最需要保活的时候不更新
     - name: 🕒 更新运行时间
+      if: always()
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"

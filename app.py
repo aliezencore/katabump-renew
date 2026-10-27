@@ -2,18 +2,140 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
+import json
 import time
+import uuid
+import shutil
+import tempfile
 import subprocess
 import requests
 from seleniumbase import SB
 
-# 从环境变量获取账号密码和 TG 配置
-EMAIL        = os.environ.get("KATABUMP_EMAIL") or ""    # 登录邮箱
-PASSWORD     = os.environ.get("KATABUMP_PASSWORD") or "" # 账号密码
+# 当前正在处理的账号（由 set_current_account 切换；login / send_tg_message 读取）
+EMAIL        = ""
+PASSWORD     = ""
+
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""        # tg通知 chat id(可选)
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""      # tg通知bot token(可选)
 
 BASE_URL = "https://dashboard.katabump.com"  # 网站链接
+
+
+# ===== 多账号支持 =====
+
+def set_current_account(email, password):
+    """切换当前处理的账号（login / send_tg_message 仍读这两个全局）"""
+    global EMAIL, PASSWORD
+    EMAIL, PASSWORD = email, password
+
+
+def _mask_email(email):
+    """日志/通知用的邮箱脱敏：保留用户名前2位和后2位"""
+    if "@" not in email:
+        return email[:2] + "****"
+    name, domain = email.split("@", 1)
+    return f"{name[:2]}****{name[-2:]}@{domain}" if len(name) > 4 else f"{name}@{domain}"
+
+
+def _as_text(value):
+    """把 JSON 里的任意标量归一化成 str，避免数字/布尔导致 .strip()/.replace() 崩溃"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _load_accounts():
+    """返回 [(email, password), ...]
+
+    优先读取 KATABUMP_ACCOUNTS（JSON 数组）；
+    完全未配置该项时，回落到旧的单账号 KATABUMP_EMAIL + KATABUMP_PASSWORD。
+    注意：KATABUMP_ACCOUNTS 一旦配置但格式非法，直接返回空列表（不回落），
+    避免「报了错却只续一个账号」的静默降级。
+    """
+    raw = (os.environ.get("KATABUMP_ACCOUNTS") or "").strip()
+    accounts = []
+
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception as ex:
+            print(f"❌ KATABUMP_ACCOUNTS JSON 解析失败: {ex}")
+            return []
+
+        if not isinstance(data, list):
+            print('❌ KATABUMP_ACCOUNTS 必须是 JSON 数组，例如 [{"email":"a@x.com","password":"p"}]')
+            return []
+
+        for i, item in enumerate(data, 1):
+            if not isinstance(item, dict):
+                print(f"⚠️ 第 {i} 项不是对象，已跳过")
+                continue
+            e = _as_text(item.get("email")).strip()
+            p = _as_text(item.get("password"))
+            if e and p:
+                accounts.append((e, p))
+            else:
+                print(f"⚠️ 第 {i} 项邮箱或密码为空，已跳过: {e or '(空邮箱)'}")
+
+        return accounts
+
+    # 未配置 KATABUMP_ACCOUNTS，走旧单账号配置
+    e = (os.environ.get("KATABUMP_EMAIL") or "").strip()
+    p = os.environ.get("KATABUMP_PASSWORD") or ""
+    if e and p:
+        accounts.append((e, p))
+
+    return accounts
+
+
+# ===== 浏览器 profile 隔离与清理 =====
+
+def _clear_profile(profile_dir):
+    """删除指定 profile 目录（浏览器已退出后才能删干净）"""
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return True
+    for attempt in range(5):
+        try:
+            shutil.rmtree(profile_dir, ignore_errors=False)
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception as e:
+            print(f"⚠️ 清理 profile 第 {attempt + 1} 次失败: {e}")
+            time.sleep(0.5)
+    # 最后兜底：忽略错误强删
+    shutil.rmtree(profile_dir, ignore_errors=True)
+    return not os.path.isdir(profile_dir)
+
+
+def _safe_error(e, *secrets):
+    """把异常文本转成可安全打印的字符串：剔除密码等敏感片段"""
+    msg = f"{type(e).__name__}: {e}"
+    for s in secrets:
+        if s and len(s) >= 3:
+            msg = msg.replace(s, "***")
+    return msg[:300]
+
+
+def _reset_browser_state(profile_dir):
+    """账号之间的隔离动作：删除本账号的 profile 目录
+
+    浏览器进程已由 with SB(...) 的 __exit__ 关闭，这里只需清掉 profile，
+    下个账号会拿到全新目录，cookie / 缓存 / 登录态自然为空。
+    """
+    print("🧹 清理浏览器缓存...")
+    ok = _clear_profile(profile_dir)
+    if ok:
+        print("✅ profile 目录已删除，下个账号使用全新环境")
+    else:
+        print("⚠️ profile 目录未能完全删除，继续执行")
+    return ok
+
 
 #  Telegram 推送模块
 def send_tg_message(status_icon, status_text, time_left=""):
@@ -26,14 +148,7 @@ def send_tg_message(status_icon, status_text, time_left=""):
     current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
 
     # 邮箱脱敏：保留用户名前2位和后2位，中间用****代替
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
-    else:
-        masked_email = EMAIL[:2] + '****'
+    masked_email = _mask_email(EMAIL)
 
     text = (
         f"🇫🇷 katabump 续期通知\n\n"
@@ -41,6 +156,9 @@ def send_tg_message(status_icon, status_text, time_left=""):
         f"👤 续期账户: {masked_email}\n"
         f"⏱️ 续期时间: {current_time_str}"
     )
+    # 第三个参数承载页面原文/附加说明，之前被丢弃，导致告警只有标题没有细节
+    if time_left:
+        text += f"\n📄 详情: {time_left}"
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
@@ -53,9 +171,11 @@ def send_tg_message(status_icon, status_text, time_left=""):
         if r.status_code == 200:
             print("📩 Telegram 通知发送成功！")
         else:
-            print(f"⚠️ Telegram 通知发送失败: {r.text}")
+            # 不回显 r.text / 异常原文：其中可能包含带 bot token 的请求 URL
+            print(f"⚠️ Telegram 通知发送失败: HTTP {r.status_code}")
     except Exception as e:
-        print(f"⚠️ Telegram 通知发送异常: {e}")
+        # 只打印异常类型，避免 bot token 随 URL 进入 Actions 日志
+        print(f"⚠️ Telegram 通知发送异常: {type(e).__name__}")
 
 #  页面注入脚本
 _EXPAND_JS = """
@@ -274,7 +394,6 @@ def login(sb) -> bool:
             page_title = sb.get_title() or ""
             print(f"  当前 URL: {cur_url}")
             print(f"  当前标题: {page_title}")
-            sb.save_screenshot("login_load_fail.png")
             return False
 
     print("🍪 关闭可能的 Cookie 弹窗...")
@@ -308,7 +427,6 @@ def login(sb) -> bool:
     if ts_found:
         if not handle_turnstile(sb):
             print("❌ 登录界面的 Turnstile 验证失败")
-            sb.save_screenshot("login_turnstile_fail.png")
             return False
     else:
         print("ℹ️ 未检测到 Turnstile")
@@ -321,17 +439,16 @@ def login(sb) -> bool:
         time.sleep(1)
         cur_url = sb.get_current_url().split('?')[0].lower()
         page_title = sb.get_title() or ""
-        if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
+        if cur_url.startswith(f"{BASE_URL}/dashboard") or "dashboard | katabump" in page_title.lower():
             break
 
     cur_url = sb.get_current_url().split('?')[0].lower()
     page_title = sb.get_title() or ""
-    if cur_url.startswith(f"{BASE_URL}/dashboard") or "Dashboard | KataBump" in page_title.lower():
+    if cur_url.startswith(f"{BASE_URL}/dashboard") or "dashboard | katabump" in page_title.lower():
         print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
         return True
         
     print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
-    sb.save_screenshot("login_failed.png")
     return False
 
 # ===== 自动续期流程 =====
@@ -403,7 +520,6 @@ def _goto_server_detail(sb) -> bool:
                     print(f"       - [{txt}] -> {href}")
         except Exception:
             pass
-        sb.save_screenshot("servers_page_fail.png")
         return False
 
     print("🖱️  点击 'See' 进入服务器详情页...")
@@ -574,29 +690,52 @@ def _check_renew_result(sb):
 
     if alert_text:
         print(f"📩 页面提示: {alert_text}")
-        low = alert_text.lower()
-        if "can't renew" in low or "unable" in low:
-            send_tg_message("⏳", "未到续期时间", alert_text)
-        elif any(kw in low for kw in ( "renewed", "success", "extended")):
+        # 统一处理直引号与排版引号（’ U+2019 / ‘ U+2018）
+        low = alert_text.lower().replace("\u2019", "'").replace("\u2018", "'")
+
+        # 否定语义必须优先判定，否则 "not renewed" 会被下面的 "renewed" 误判成功
+        neg_keys = (
+            "can't renew", "cannot renew", "could not renew", "couldn't renew",
+            "not renewed", "unable to renew", "failed", "error", "too early",
+            "not yet", "not allowed",
+        )
+        pos_keys = ("renewed", "success", "extended")
+
+        if any(k in low for k in neg_keys):
+            # 未到续期时间 vs 其他失败，分别给出不同提示
+            if any(k in low for k in ("can't renew", "cannot renew", "too early",
+                                      "not yet", "not allowed")):
+                send_tg_message("⏳", "未到续期时间", alert_text)
+            else:
+                send_tg_message("❌", "续期失败", alert_text)
+        elif any(k in low for k in pos_keys):
             send_tg_message("✅", "续期成功", alert_text)
         else:
             send_tg_message("ℹ️", "续期操作已执行", alert_text)
     else:
         print("ℹ️ 未检测到明确的提示框，可能续期操作未生效")
-        send_tg_message("ℹ️", "续期操作已执行", "未检测到明确提示")
+        send_tg_message("ℹ️", "未检测到明确提示", "请手动确认续期结果")
 
 
 def renew_server(sb):
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交"""
+    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交
+
+    返回 True 表示「提交动作已执行」，False 表示流程中断（未找到详情页/Renew 按钮）。
+    注意：具体续期成败仍以 _check_renew_result 的页面提示为准。
+    """
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
 
     if not _goto_server_detail(sb):
-        return
+        print("❌ 未能进入服务器详情页，续期流程中断")
+        send_tg_message("❌", "未能进入服务器详情页")
+        return False
 
     if not _open_renew_modal(sb):
-        return
+        print("❌ 未能打开 Renew 弹窗（可能未到续期时间）")
+        send_tg_message("❌", "未能打开 Renew 弹窗（可能未到续期时间）")
+        return False
 
     # altcha_ok = _solve_altcha(sb)
     # if not altcha_ok:
@@ -604,6 +743,7 @@ def renew_server(sb):
 
     _submit_renew(sb)
     _check_renew_result(sb)
+    return True
 
 
 #  脚本执行入口 (可选代理)
@@ -611,6 +751,14 @@ def main():
     print("#" * 25)
     print("   katabump 自动登录续期")
     print("#" * 25)
+
+    accounts = _load_accounts()
+    if not accounts:
+        print("❌ 未配置账号：请设置 KATABUMP_ACCOUNTS（JSON 数组），"
+              "或 KATABUMP_EMAIL + KATABUMP_PASSWORD")
+        send_tg_message("❌", "未配置账号")
+        sys.exit(1)
+    print(f"👥 待处理账号数: {len(accounts)}")
 
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1081"
@@ -621,21 +769,63 @@ def main():
         sb_kwargs["proxy"] = proxy_str
     else:
         print("🌐 未使用代理，直连访问")
-    
-    print("🚀 启动浏览器...")
-    with SB(**sb_kwargs) as sb:
-        # print("✅ 浏览器已启动")
-        try:
-            sb.open("https://api.ip.sb/ip")
-            print(f"📍  当前出口IP: {sb.get_text('body')}")
-        except Exception:
-            pass
 
-        if login(sb):
-            renew_server(sb)   # 登录成功后自动续期
-        else:
-            print("\n❌ 登录失败，终止后续续期操作。")
-            send_tg_message("❌", "登录失败", "未知")
+    results = []
+    for idx, (email, password) in enumerate(accounts, 1):
+        set_current_account(email, password)
+        print("\n" + "=" * 25)
+        print(f"  [{idx}/{len(accounts)}] {_mask_email(email)}")
+        print("=" * 25)
+
+        # 每个账号一个独立的临时 profile 目录，退出后删除
+        profile_dir = os.path.join(
+            tempfile.gettempdir(), f"katabump_profile_{uuid.uuid4().hex[:12]}"
+        )
+
+        ok = False
+        try:
+            print("🚀 启动浏览器...")
+            # user_data_dir 指向独立目录：seleniumbase 不会复用它，也不会自动删
+            # 退出 with 块时浏览器自动关闭，下个账号拿到全新 profile
+            with SB(user_data_dir=profile_dir, **sb_kwargs) as sb:
+                try:
+                    sb.open("https://api.ip.sb/ip")
+                    print(f"📍  当前出口IP: {sb.get_text('body')}")
+                except Exception:
+                    pass
+
+                if login(sb):
+                    ok = renew_server(sb)   # 返回 True 才表示续期流程走完
+                else:
+                    print("\n❌ 登录失败，终止该账号后续续期操作。")
+                    send_tg_message("❌", "登录失败")
+        except Exception as e:
+            # 单个账号异常不影响后续账号；异常文本可能含明文密码，需脱敏
+            safe = _safe_error(e, password)
+            print(f"❌ 账号 {_mask_email(email)} 运行异常: {safe}")
+            send_tg_message("❌", f"运行异常: {safe}")
+        finally:
+            # 无论成功失败，都清理本账号的 profile；清理异常不得中断后续账号
+            try:
+                _reset_browser_state(profile_dir)
+            except Exception as ce:
+                print(f"⚠️ 清理 profile 时出错（已忽略）: {ce}")
+
+        results.append((email, ok))
+
+    # 汇总（ok 表示「登录成功并已执行续期流程」，具体续期结果见各账号的 TG 通知）
+    ok_cnt = sum(1 for _, o in results if o)
+    print("\n" + "#" * 25)
+    print(f"  汇总：登录成功 {ok_cnt} / 共 {len(results)}")
+    for email, ok in results:
+        print(f"   {'✅' if ok else '❌'} {_mask_email(email)}")
+    print("#" * 25)
+
+    # 全部账号失败时以非零退出码结束，让 Actions 标记为失败
+    if ok_cnt == 0:
+        print("❌ 所有账号均未成功，退出码 1")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
